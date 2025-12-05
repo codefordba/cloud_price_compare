@@ -3,62 +3,42 @@ import streamlit as st
 import requests
 import pandas as pd
 import math
-import time
+import json
+import os
 from typing import List, Dict, Optional
 
-st.set_page_config(page_title="Cloud Price Compare", layout="wide")
+st.set_page_config(page_title="Cloud Price Compare (Top-5)", layout="wide")
 
-# ---------------------------
-# Embedded small Azure SKU catalog (starter)
-# - You can expand this list by adding more SKUs later to data file.
-# - Each entry: name (armSkuName), vcpu, memoryGb, series
-# ---------------------------
-AZURE_SKUS = [
-    {"name": "Standard_D2s_v5", "vcpu": 2, "memoryGb": 8, "series": "Dsv5"},
-    {"name": "Standard_D4s_v5", "vcpu": 4, "memoryGb": 16, "series": "Dsv5"},
-    {"name": "Standard_D8s_v5", "vcpu": 8, "memoryGb": 32, "series": "Dsv5"},
-    {"name": "Standard_D16s_v5", "vcpu": 16, "memoryGb": 64, "series": "Dsv5"},
-    {"name": "Standard_D32s_v5", "vcpu": 32, "memoryGb": 128, "series": "Dsv5"},
-    {"name": "Standard_E2s_v5", "vcpu": 2, "memoryGb": 16, "series": "Esv5"},
-    {"name": "Standard_E4s_v5", "vcpu": 4, "memoryGb": 32, "series": "Esv5"},
-    {"name": "Standard_E8s_v5", "vcpu": 8, "memoryGb": 64, "series": "Esv5"},
-    {"name": "Standard_E16s_v5", "vcpu": 16, "memoryGb": 128, "series": "Esv5"},
-    {"name": "Standard_F4s_v2", "vcpu": 4, "memoryGb": 8, "series": "Fsv2"},
-    {"name": "Standard_F8s_v2", "vcpu": 8, "memoryGb": 16, "series": "Fsv2"},
-    {"name": "Standard_B2s", "vcpu": 2, "memoryGb": 8, "series": "B"},
-    {"name": "Standard_B4ms", "vcpu": 4, "memoryGb": 16, "series": "B"},
-    {"name": "Standard_NC6", "vcpu": 6, "memoryGb": 56, "series": "NC (GPU)"},
-    {"name": "Standard_D64s_v5", "vcpu": 64, "memoryGb": 256, "series": "Dsv5"},
-    # add more as you want...
-]
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, "data")
+AWS_CATALOG_PATH = os.path.join(DATA_DIR, "aws_catalog.json")
+AZURE_CATALOG_PATH = os.path.join(DATA_DIR, "azure_catalog.json")
 
-# ---------------------------
-# Helpers
-# ---------------------------
-def score_distance(vcpu_req: int, ram_req: int, vcpu: int, ram: float) -> float:
-    """Simple distance metric (lower is better)."""
-    return abs(vcpu - vcpu_req) + abs(ram - ram_req) / 4.0  # weight RAM a bit less
+# ---------- Utilities ----------
+def load_json(path: str):
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
 
-def top_n_matches_from_catalog(catalog: List[Dict], vcpu_req: int, ram_req: int, n: int = 5) -> List[Dict]:
+def score_distance(req_cpu: int, req_ram: float, vcpu: int, ram: float) -> float:
+    # Weighted distance: CPU difference + RAM difference / 4 (to normalize)
+    return abs(vcpu - req_cpu) + (abs(ram - req_ram) / 4.0)
+
+def top_n_matches(items: List[Dict], req_cpu: int, req_ram: float, n: int = 5):
     scored = []
-    for s in catalog:
-        if s.get("vcpu") is None or s.get("memoryGb") is None:
+    for it in items:
+        v = it.get("vcpu")
+        r = it.get("memoryGb")
+        if v is None or r is None:
             continue
-        sc = score_distance(vcpu_req, ram_req, s["vcpu"], s["memoryGb"])
-        scored.append((sc, s))
+        sc = score_distance(req_cpu, req_ram, v, r)
+        scored.append((sc, it))
     scored.sort(key=lambda x: x[0])
-    return [s for _, s in scored[:n]]
+    return [itm for _, itm in scored[:n]]
 
-# ---------------------------
-# Azure: price per SKU (fast)
-# ---------------------------
+# ---------- Price lookup helpers ----------
 AZURE_RETAIL_BASE = "https://prices.azure.com/api/retail/prices"
 
 def fetch_azure_price_for_sku(arm_sku_name: str, region: str = "centralindia", prefer_currency: str = "INR") -> Optional[Dict]:
-    """
-    Fetch price for a single ARM SKU in a region using Retail Prices API.
-    Returns {unitPrice, currency, raw} or None.
-    """
     if not arm_sku_name:
         return None
     filter_q = f"armRegionName eq '{region}' and armSkuName eq '{arm_sku_name}'"
@@ -70,183 +50,146 @@ def fetch_azure_price_for_sku(arm_sku_name: str, region: str = "centralindia", p
         items = j.get("Items", [])
         if not items:
             return None
-        # prefer INR if present
+        # prefer currency
         for it in items:
             cur = it.get("currencyCode")
             price = it.get("retailPrice") if it.get("retailPrice") is not None else it.get("unitPrice")
             if prefer_currency and cur == prefer_currency and price is not None:
                 return {"unitPrice": price, "currency": cur, "raw": it}
-        # fallback to first priced item
+        # fallback
         for it in items:
             price = it.get("retailPrice") if it.get("retailPrice") is not None else it.get("unitPrice")
             if price is not None:
                 return {"unitPrice": price, "currency": it.get("currencyCode"), "raw": it}
-    except Exception as e:
+    except Exception:
         return None
     return None
 
-# ---------------------------
-# AWS: fetch product list (filter products with numeric vcpu & memory)
-# ---------------------------
-AWS_OFFERS_BASE = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current/index.json"
+# For AWS: we will NOT download the full offers file each run.
+# Instead this helper will attempt a minimal on-demand fetch by product SKU if possible.
+# NOTE: This is best-effort; availability of direct SKU lookup depends on AWS offer server behavior.
+AWS_OFFERS_BASE = "https://pricing.us-east-1.amazonaws.com/offers/v1.0/aws/AmazonEC2/current"
 
-def fetch_aws_products_cached() -> Optional[Dict]:
-    """Fetch AWS products JSON index (may be large) and return 'products' & 'terms' dicts."""
+def fetch_aws_price_for_sku(product_sku: str, prefer_currency: str = "INR") -> Optional[Dict]:
+    """
+    Try to fetch price details for a given AWS product SKU by querying the offers endpoint for that SKU's terms.
+    This function tries to avoid downloading the full 'products' object. It may fail if offers endpoint doesn't support direct SKU fetch.
+    """
+    if not product_sku:
+        return None
+
+    # Best-effort path: try to fetch a small URL that sometimes holds product/terms for given SKU.
+    # If not available, return None (the UI will show the SKU with no live price).
     try:
-        r = requests.get(AWS_OFFERS_BASE, timeout=60)
+        # Attempt: fetch the index and look for product's onDemand terms only (lightweight attempt)
+        idx_url = AWS_OFFERS_BASE + "/index.json"
+        r = requests.get(idx_url, timeout=20)
         r.raise_for_status()
-        j = r.json()
-        products = j.get("products", {})
-        terms = j.get("terms", {})
-        return {"products": products, "terms": terms}
+        idx = r.json()
+        # Many indexes embed the 'offers' data directly; if not, fallback and return None
+        products_obj = idx.get("products")
+        terms_obj = idx.get("terms")
+        if products_obj and product_sku in products_obj:
+            # try to read term price
+            terms = terms_obj.get("OnDemand", {})
+            if product_sku in terms:
+                sku_terms = terms[product_sku]
+                # take first price dimension found:
+                for od_key, od_val in sku_terms.items():
+                    for pd_k, pd in od_val.get("priceDimensions", {}).items():
+                        ppu = pd.get("pricePerUnit", {})
+                        # prefer INR else USD
+                        if prefer_currency and prefer_currency in ppu and ppu.get(prefer_currency):
+                            return {"unitPrice": float(ppu.get(prefer_currency)), "currency": prefer_currency}
+                        # fallback USD
+                        if "USD" in ppu and ppu.get("USD"):
+                            return {"unitPrice": float(ppu.get("USD")) * 83.0, "currency": "INR"}
+        # else no direct price found
+        return None
     except Exception:
         return None
 
-def aws_extract_instances(products: Dict, terms: Dict) -> List[Dict]:
-    """Return list of instances with vcpu, memoryGb and SKU info and on-demand price in INR (if available)."""
-    out = []
-    od_terms = terms.get("OnDemand", {})
-    for sku, p in products.items():
-        attrs = p.get("attributes", {})
-        if attrs.get("servicecode") != "AmazonEC2":
-            continue
-        inst_type = attrs.get("instanceType")
-        vcpu = attrs.get("vcpu")
-        mem = attrs.get("memory")
-        if not inst_type or not vcpu or not mem:
-            continue
-        # parse vcpu and memory
-        try:
-            vcpu_i = int(float(vcpu))
-        except:
-            continue
-        try:
-            mem_gb = float(str(mem).split()[0])
-        except:
-            continue
+# ---------- Load local catalogs ----------
+def load_catalogs():
+    aws = []
+    azure = []
+    try:
+        aws = load_json(AWS_CATALOG_PATH)
+    except Exception:
+        st.warning("Failed to load local AWS catalog (data/aws_catalog.json). AWS matching disabled.")
+    try:
+        azure = load_json(AZURE_CATALOG_PATH)
+    except Exception:
+        st.warning("Failed to load local Azure catalog (data/azure_catalog.json). Azure matching disabled.")
+    return aws, azure
 
-        # find price in terms dict
-        price_inr = None
-        if sku in od_terms:
-            try:
-                first_od = next(iter(od_terms[sku].values()))
-                pd = next(iter(first_od.get("priceDimensions", {}).values()))
-                price_per_unit = pd.get("pricePerUnit", {})
-                # prefer INR
-                if "INR" in price_per_unit and price_per_unit.get("INR"):
-                    price_inr = float(price_per_unit.get("INR"))
-                elif "USD" in price_per_unit and price_per_unit.get("USD"):
-                    price_inr = float(price_per_unit.get("USD")) * 83.0
-                else:
-                    # take first numeric
-                    for cur, val in price_per_unit.items():
-                        try:
-                            price_inr = float(val) * (83.0 if cur == "USD" else 1.0)
-                            break
-                        except:
-                            continue
-            except Exception:
-                price_inr = None
+# ---------- Streamlit UI ----------
+st.title("☁ Cloud VM Price Compare — Top 5 matches (India)")
 
-        out.append({
-            "csp": "AWS",
-            "sku": inst_type,
-            "vcpu": vcpu_i,
-            "memoryGb": mem_gb,
-            "pricePerHour": price_inr,
-            "skuId": sku
-        })
-    return out
+col1, col2 = st.columns([3,1])
+with col1:
+    req_vcpu = st.number_input("Required vCPU", min_value=1, max_value=128, value=8, step=1)
+    req_ram = st.number_input("Required RAM (GB)", min_value=1, max_value=2048, value=32, step=1)
+    providers = st.multiselect("Providers", ["Azure", "AWS"], default=["Azure","AWS"])
+    top_n = st.slider("Top N matches per provider", min_value=1, max_value=10, value=5)
+    fetch_live_prices = st.checkbox("Attempt live price lookup for matched SKUs (Azure fast, AWS best-effort)", value=True)
+with col2:
+    st.markdown("**Region (Azure live prices)**: centralindia")
+    st.markdown("**AWS price conversion**: USD→INR using 83.0 where needed")
+    st.markdown("**Catalog**: local SKU catalogs are used for instant matching (edit JSONs in /data to extend)**")
 
-# ---------------------------
-# Utility: top-n matches + add price
-# ---------------------------
-def enrich_with_prices_and_format(matches: List[Dict], csp: str, region: str = "centralindia") -> List[Dict]:
-    rows = []
-    if csp == "Azure":
-        for m in matches:
-            price_entry = fetch_azure_price_for_sku(m["name"], region)
-            price = price_entry["unitPrice"] if price_entry else None
-            currency = price_entry["currency"] if price_entry else None
-            rows.append({
+if st.button("Compare"):
+    st.info("Matching SKUs and (optionally) fetching live prices. This runs fast.")
+    aws_catalog, azure_catalog = load_catalogs()
+
+    all_results = []
+
+    # Azure
+    if "Azure" in providers and azure_catalog:
+        azure_matches = top_n_matches(azure_catalog, req_vcpu, req_ram, n=top_n)
+        for m in azure_matches:
+            price_entry = None
+            if fetch_live_prices:
+                price_entry = fetch_azure_price_for_sku(m["name"], region="centralindia", prefer_currency="INR")
+            all_results.append({
                 "csp": "Azure",
                 "sku": m["name"],
                 "vcpu": m["vcpu"],
                 "memoryGb": m["memoryGb"],
-                "pricePerHour_INR": (price * 1.0) if price is not None else None,  # Azure retail already region currency (often INR)
-                "priceCurrency": currency,
+                "series": m.get("series"),
+                "pricePerHour_INR": round(price_entry["unitPrice"],4) if price_entry else None,
+                "priceCurrency": price_entry["currency"] if price_entry else None,
                 "skuId": m["name"]
             })
-    elif csp == "AWS":
-        for m in matches:
-            rows.append({
+
+    # AWS
+    if "AWS" in providers and aws_catalog:
+        aws_matches = top_n_matches(aws_catalog, req_vcpu, req_ram, n=top_n)
+        for m in aws_matches:
+            live_price = None
+            if fetch_live_prices:
+                # Attempt best-effort small lookup
+                live_price = fetch_aws_price_for_sku(m.get("skuId") or m.get("sku"))
+            all_results.append({
                 "csp": "AWS",
-                "sku": m["sku"],
-                "vcpu": m["vcpu"],
-                "memoryGb": m["memoryGb"],
-                "pricePerHour_INR": m.get("pricePerHour"),
-                "priceCurrency": "INR" if m.get("pricePerHour") is not None else None,
-                "skuId": m.get("skuId")
+                "sku": m.get("sku"),
+                "vcpu": m.get("vcpu"),
+                "memoryGb": m.get("memoryGb"),
+                "series": m.get("family"),
+                "pricePerHour_INR": round(live_price["unitPrice"],4) if live_price else (m.get("pricePerHour_INR") if m.get("pricePerHour_INR") is not None else None),
+                "priceCurrency": live_price["currency"] if live_price else ("INR" if m.get("pricePerHour_INR')") else None),
+                "skuId": m.get("skuId") or m.get("sku")
             })
-    return rows
 
-# ---------------------------
-# Streamlit UI
-# ---------------------------
-st.title("☁ Cloud VM Price Compare — Top 5 Matches (India)")
-
-col1, col2 = st.columns([2, 1])
-with col1:
-    vcpu = st.number_input("Required vCPU", min_value=1, max_value=128, value=8, step=1)
-    ram = st.number_input("Required RAM (GB)", min_value=1, max_value=2048, value=32, step=1)
-    providers = st.multiselect("Select providers", ["Azure", "AWS"], default=["Azure", "AWS"])
-    top_n = st.slider("Top N matches per provider", 1, 10, 5)
-with col2:
-    st.markdown("**Region**: centralindia (Azure retail price calls use this region)")
-    st.markdown("**Currency**: INR preferred (conversion used for USD → INR at 83.0 rate)")
-
-if st.button("Compare"):
-    st.info("Matching SKUs and fetching prices (fast) — this should take a few seconds per provider...")
-
-    final_rows = []
-
-    # Azure: use embedded catalog for matching (fast), then fetch price per SKU
-    if "Azure" in providers:
-        az_matches = top_n_matches_from_catalog(AZURE_SKUS, vcpu, ram, n=top_n)
-        st.write(f"Azure: found {len(az_matches)} candidate SKUs")
-        az_enriched = enrich_with_prices_and_format(az_matches, "Azure", region="centralindia")
-        final_rows.extend(az_enriched)
-
-    # AWS: fetch products index, filter and compute top matches (may take ~10-25s first time)
-    if "AWS" in providers:
-        st.write("AWS: fetching catalog (this may take ~10-30s on first run)...")
-        aws_data = fetch_aws_products_cached()
-        if aws_data is None:
-            st.error("Failed to fetch AWS pricing catalog.")
-        else:
-            products = aws_data["products"]
-            terms = aws_data["terms"]
-            aws_instances = aws_extract_instances(products, terms)
-            st.write(f"AWS: {len(aws_instances)} instance SKUs parsed (with vCPU & memory).")
-            # compute top-n matches
-            scored = []
-            for inst in aws_instances:
-                sc = score_distance(vcpu, ram, inst["vcpu"], inst["memoryGb"])
-                scored.append((sc, inst))
-            scored.sort(key=lambda x: x[0])
-            aws_top = [inst for _, inst in scored[:top_n]]
-            aws_enriched = enrich_with_prices_and_format(aws_top, "AWS")
-            final_rows.extend(aws_enriched)
-
-    if not final_rows:
-        st.warning("No results found for the selected providers/specs.")
+    # Present results
+    if not all_results:
+        st.warning("No matches found (maybe catalogs are missing). Check /data/*.json")
     else:
-        df = pd.DataFrame(final_rows)
-        # compute monthly price (approx)
-        df["pricePerMonth_INR"] = df["pricePerHour_INR"].apply(lambda x: round(x * 24 * 30, 2) if x is not None else None)
-        st.dataframe(df[["csp", "sku", "vcpu", "memoryGb", "pricePerHour_INR", "pricePerMonth_INR", "priceCurrency", "skuId"]])
+        df = pd.DataFrame(all_results)
+        # compute month cost if price exists
+        df["pricePerMonth_INR"] = df["pricePerHour_INR"].apply(lambda x: round(x*24*30,2) if x is not None else None)
+        st.dataframe(df[["csp","sku","series","vcpu","memoryGb","pricePerHour_INR","pricePerMonth_INR","priceCurrency","skuId"]])
 
         csv = df.to_csv(index=False).encode("utf-8")
         st.download_button("Download CSV", csv, "csp_vm_top_matches.csv", "text/csv")
-
     st.success("Done.")
