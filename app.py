@@ -7,14 +7,23 @@ import math
 def find_best_match(instances, req_cpu, req_ram):
     best = None
     best_score = math.inf
+
     for inst in instances:
-        cpu = inst.get("vcpu", 0)
-        ram = inst.get("memoryGb", 0)
+        cpu = inst.get("vcpu")
+        ram = inst.get("memoryGb")
+
+        # skip records where CPU or RAM is missing
+        if cpu is None or ram is None:
+            continue
+
         score = abs(cpu - req_cpu) + abs(ram - req_ram)
+
         if score < best_score:
             best_score = score
             best = inst
+
     return best
+
 
 # ---------------- Fetch Azure Pricing ----------------
 def fetch_azure():
@@ -23,17 +32,18 @@ def fetch_azure():
     while url:
         data = requests.get(url).json()
         for item in data.get("Items", []):
-            if item.get("armSkuName") and item.get("unitPrice", 0) > 0:
+            if item.get("unitPrice", 0) > 0:
                 results.append({
                     "csp": "Azure",
-                    "sku": item["armSkuName"],
-                    "vcpu": item.get("cores"),
-                    "memoryGb": item.get("ram"),
+                    "sku": item.get("armSkuName"),
+                    "vcpu": item.get("cores"),            # may be None
+                    "memoryGb": item.get("ram"),          # may be None
                     "pricePerHour": item["unitPrice"] * 83,
                     "skuId": item.get("armSkuName")
                 })
         url = data.get("NextPageLink")
     return results
+
 
 # ---------------- Fetch AWS Pricing ----------------
 def fetch_aws():
