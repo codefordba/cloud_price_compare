@@ -1,0 +1,16 @@
+[
+  {"name":"Standard_D2s_v5","vcpu":2,"memoryGb":8,"series":"Dsv5"},
+  {"name":"Standard_D4s_v5","vcpu":4,"memoryGb":16,"series":"Dsv5"},
+  {"name":"Standard_D8s_v5","vcpu":8,"memoryGb":32,"series":"Dsv5"},
+  {"name":"Standard_D16s_v5","vcpu":16,"memoryGb":64,"series":"Dsv5"},
+  {"name":"Standard_D32s_v5","vcpu":32,"memoryGb":128,"series":"Dsv5"},
+  {"name":"Standard_D64s_v5","vcpu":64,"memoryGb":256,"series":"Dsv5"},
+  {"name":"Standard_E2s_v5","vcpu":2,"memoryGb":16,"series":"Esv5"},
+  {"name":"Standard_E4s_v5","vcpu":4,"memoryGb":32,"series":"Esv5"},
+  {"name":"Standard_E8s_v5","vcpu":8,"memoryGb":64,"series":"Esv5"},
+  {"name":"Standard_F4s_v2","vcpu":4,"memoryGb":8,"series":"Fsv2"},
+  {"name":"Standard_F8s_v2","vcpu":8,"memoryGb":16,"series":"Fsv2"},
+  {"name":"Standard_B2s","vcpu":2,"memoryGb":8,"series":"B"},
+  {"name":"Standard_B4ms","vcpu":4,"memoryGb":16,"series":"B"},
+  {"name":"Standard_NC6","vcpu":6,"memoryGb":56,"series":"NC (GPU)"}
+]
