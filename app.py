@@ -330,4 +330,26 @@ if st.button("Compare Pricing"):
             results.append(match)
             status_msgs.append("GCP: matched SKU " + str(match.get("sku")))
         else:
-            status_msgs.append("GCP:_
+            status_msgs.append("GCP: no match found or GCP pricelist not available.")
+
+    # show status messages
+    for m in status_msgs:
+        st.write("• " + m)
+
+    if not results:
+        st.warning("No matching SKUs found for the selected providers. Try relaxing filters or try a different region/selection.")
+    else:
+        # build DataFrame; ensure columns exist
+        df = pd.DataFrame(results)
+        # normalize columns if missing
+        for col in ["csp", "sku", "vcpu", "memoryGb", "pricePerHour", "skuId"]:
+            if col not in df.columns:
+                df[col] = None
+
+        # show friendly price columns
+        df["pricePerHour"] = df["pricePerHour"].astype(float).round(4)
+        df["pricePerMonth"] = (df["pricePerHour"] * 24 * 30).round(2)
+        st.dataframe(df[["csp", "sku", "vcpu", "memoryGb", "pricePerHour", "pricePerMonth", "skuId"]])
+
+        csv = df.to_csv(index=False).encode("utf-8")
+        st.download_button("Download CSV", csv, file_name="comparison_output.csv", mime="text/csv")
